@@ -1,0 +1,327 @@
+diff -uNr kernel.old/arch/x86/syscalls/syscall_32.tbl kernel.new/arch/x86/syscalls/syscall_32.tbl
+--- kernel.old/arch/x86/syscalls/syscall_32.tbl	2017-06-17 10:44:31.000000000 -0700
++++ kernel.new/arch/x86/syscalls/syscall_32.tbl	2020-04-29 22:01:06.667433000 -0700
+@@ -365,3 +365,5 @@
+ 356	i386	memfd_create		sys_memfd_create
+ 357	i386	bpf			sys_bpf
+ 358	i386	execveat		sys_execveat			stub32_execveat
++359	i386	insdump		sys_insdump
++360	i386	rmdump			sys_rmdump
+diff -uNr kernel.old/include/linux/dynamic_dump_stack.h kernel.new/include/linux/dynamic_dump_stack.h
+--- kernel.old/include/linux/dynamic_dump_stack.h	1969-12-31 17:00:00.000000000 -0700
++++ kernel.new/include/linux/dynamic_dump_stack.h	2020-05-01 21:56:11.138274000 -0700
+@@ -0,0 +1,10 @@
++//for accessing this method in do_exit()
++extern int remove_residual_kprobes(pid_t pid);
++
++//for user programs to use
++struct dumpmode_t {
++	unsigned int mode;
++};
++
++// to make probe list accessible
++extern struct list_head probe_list;
+\ No newline at end of file
+diff -uNr kernel.old/include/linux/syscalls.h kernel.new/include/linux/syscalls.h
+--- kernel.old/include/linux/syscalls.h	2017-06-17 10:44:57.000000000 -0700
++++ kernel.new/include/linux/syscalls.h	2020-04-29 22:03:22.542071000 -0700
+@@ -65,6 +65,7 @@
+ struct perf_event_attr;
+ struct file_handle;
+ struct sigaltstack;
++struct dumpmode_t;
+ union bpf_attr;
+ 
+ #include <linux/types.h>
+@@ -881,5 +882,9 @@
+ asmlinkage long sys_execveat(int dfd, const char __user *filename,
+ 			const char __user *const __user *argv,
+ 			const char __user *const __user *envp, int flags);
++			
++asmlinkage long sys_insdump(const char __user *symbolname, struct dumpmode_t __user * mode);
++
++asmlinkage long sys_rmdump(unsigned int dumpid);
+ 
+ #endif
+diff -uNr kernel.old/kernel/exit.c kernel.new/kernel/exit.c
+--- kernel.old/kernel/exit.c	2017-06-17 10:44:58.000000000 -0700
++++ kernel.new/kernel/exit.c	2020-05-01 21:59:22.553644000 -0700
+@@ -59,6 +59,8 @@
+ #include <asm/pgtable.h>
+ #include <asm/mmu_context.h>
+ 
++#include <linux/dynamic_dump_stack.h>
++
+ static void exit_mm(struct task_struct *tsk);
+ 
+ static void __unhash_process(struct task_struct *p, bool group_dead)
+@@ -655,7 +657,11 @@
+ 	int group_dead;
+ 	TASKS_RCU(int tasks_rcu_i);
+ 
+-	profile_task_exit(tsk);
++	//if CONFIG_DYNAMIC_DUMP_STACK enabled, do kprobe cleaning.
++	#ifdef CONFIG_DYNAMIC_DUMP_STACK
++		remove_residual_kprobes(tsk->pid);
++	#endif
++ 		profile_task_exit(tsk);
+ 
+ 	WARN_ON(blk_needs_flush_plug(tsk));
+ 
+diff -uNr kernel.old/lib/dynamic_dump_stack.c kernel.new/lib/dynamic_dump_stack.c
+--- kernel.old/lib/dynamic_dump_stack.c	1969-12-31 17:00:00.000000000 -0700
++++ kernel.new/lib/dynamic_dump_stack.c	2020-05-01 22:00:36.056720000 -0700
+@@ -0,0 +1,223 @@
++#include<linux/kernel.h>
++#include<linux/init.h>
++#include<linux/sched.h>
++#include<linux/syscalls.h>
++#include<linux/string.h>
++#include<linux/kprobes.h>
++#include<linux/kallsyms.h>
++#include<linux/module.h>
++#include<linux/types.h>
++#include<linux/slab.h>
++#include<linux/dynamic_dump_stack.h>
++
++#define SYMBOL_LEN_LIMIT 50
++
++//List for maintaining kprobes
++struct list_head probe_list = LIST_HEAD_INIT(probe_list);
++unsigned int probe_counter;	//for dump_id
++static DEFINE_MUTEX(list_lock); //for synchronized/exclusive list access
++
++//for maintaining kprobe details
++struct probe_struct{
++	unsigned int probe_id;
++	char symbol_name[SYMBOL_LEN_LIMIT];
++	unsigned int dump_mode;
++	struct kprobe probe;
++	pid_t pid;
++	pid_t tgid;
++	struct list_head list_node;
++};
++
++//for keeping track of kprobes to be removed after process termination
++struct marker_node {
++	struct list_head* pointer;
++	struct list_head list_node;
++};
++
++int handler_pre(struct kprobe *p, struct pt_regs *regs)
++{
++	pid_t pid;
++	pid_t tgid;
++	struct task_struct* this_task;
++	struct probe_struct *this_probe;
++
++	this_task = current;
++	//for checking siblings
++	tgid = this_task->tgid;
++	pid = this_task->pid;
++
++	this_probe = container_of(p, struct probe_struct, probe);
++	if(this_probe->dump_mode == 0 && this_probe->pid == pid)
++	{	
++		//Only allowing owner process to trigger dump_stack 
++		printk(KERN_NOTICE "DUMPSTACK BEGIN: symbol = %s, dumpmode = 0 - invoked by owner with pid = %d \n",this_probe->symbol_name,pid);
++		dump_stack();
++		printk(KERN_NOTICE "DUMPSTACK END: symbol = %s, dumpmode = 0 - invoked by owner with pid = %d \n",this_probe->symbol_name,pid);
++	}
++	else if(this_probe->dump_mode == 1 && (this_probe->pid == pid || this_probe->tgid == tgid))
++	{
++		//Only allowing owner process and its siblings to trigger dump_stack
++		printk(KERN_NOTICE "DUMPSTACK BEGIN: symbol = %s, dumpmode = 1 - invoked by owner/sibling with pid = %d \n",this_probe->symbol_name,pid);
++		dump_stack();
++		printk(KERN_NOTICE "DUMPSTACK END: symbol = %s, dumpmode = 1 - invoked by owner/sibling with pid = %d \n",this_probe->symbol_name,pid);
++	}
++	else if(this_probe->dump_mode > 1)
++	{
++		//Allowing all the processes to trigger dump_stack
++		printk(KERN_NOTICE "DUMPSTACK BEGIN: symbol = %s, dumpmode > 1 - invoked by process with pid = %d \n",this_probe->symbol_name,pid);
++		dump_stack();
++		printk(KERN_NOTICE "DUMPSTACK END: symbol = %s, dumpmode > 1 - invoked by process with pid = %d \n",this_probe->symbol_name,pid);
++	}
++	return 0;
++}
++
++SYSCALL_DEFINE2(insdump, const char __user*, symbolname, struct dumpmode_t __user*, mode)
++{
++	//only execute when CONFIG_DYNAMIC_DUMP_STACK is enabled
++	#ifdef CONFIG_DYNAMIC_DUMP_STACK
++		char *name;
++		struct task_struct* this_task;
++		struct probe_struct *temp_node;
++		struct dumpmode_t mode_value;
++		pid_t pid;
++		pid_t tgid;
++		unsigned long symbol_addr;
++
++		this_task = current;
++		pid = this_task->pid;
++		tgid = this_task->tgid;
++
++		printk(KERN_NOTICE "SYSCALL: insdump triggered by process with pid = %d\n",pid);
++
++		name = kmalloc(sizeof(char)*SYMBOL_LEN_LIMIT, GFP_KERNEL);
++		strncpy_from_user((char *)name,symbolname, SYMBOL_LEN_LIMIT);
++		symbol_addr = kallsyms_lookup_name(name);
++
++		if(symbol_addr == 0)
++		{
++			printk(KERN_ERR "INSDUMP: Symbol %s  not found\n", name);
++			return -EINVAL;
++		}
++
++		if(copy_from_user(&mode_value, mode, sizeof(mode_value)))
++		{
++			return -EFAULT;
++		}
++
++		temp_node = (struct probe_struct *)kmalloc(sizeof(struct probe_struct), GFP_KERNEL);
++		memset(temp_node, 0, sizeof(struct probe_struct));
++
++		memset(&temp_node->probe, 0, sizeof(struct kprobe));
++		temp_node->probe.pre_handler = handler_pre;
++		temp_node->probe.addr = (kprobe_opcode_t *)symbol_addr;
++		temp_node->probe_id = probe_counter;
++		temp_node->pid = pid;
++		temp_node->tgid = tgid;
++		temp_node->dump_mode = mode_value.mode;
++		strncpy(temp_node->symbol_name, name, SYMBOL_LEN_LIMIT);
++
++		//registering kprobe
++		if(register_kprobe(&temp_node->probe))
++		{
++			printk(KERN_ERR "INSDUMP: kprobe at symbol = %s not registered successfully\n", name);
++			return -EINVAL;
++		}
++
++		//locking mutex for exclusive list update
++		mutex_lock(&list_lock);
++		//adding newly registered kprobe to list for tracking purpose.
++		list_add(&temp_node->list_node, &probe_list);
++		mutex_unlock(&list_lock);
++		printk(KERN_NOTICE "INSDUMP: kprobe/dumpstack registered at symbol = %s. owner = %d. dumpmode = %u. dump_id = %u\n",name,pid,temp_node->dump_mode,probe_counter);
++		probe_counter++;
++		//returning dump_id
++		return temp_node->probe_id;
++	#else
++		return 0;
++	#endif
++}
++
++SYSCALL_DEFINE1(rmdump, unsigned int, dumpid)
++{
++	//only execute when CONFIG_DYNAMIC_DUMP_STACK is enabled
++	#ifdef CONFIG_DYNAMIC_DUMP_STACK
++		struct task_struct* this_task;
++		struct list_head* temp_list_node;
++		struct probe_struct* temp_probe_node;
++		pid_t pid;
++
++		this_task = current;
++		pid = this_task->pid;
++		temp_list_node = NULL;
++		temp_probe_node = NULL;
++
++		printk(KERN_NOTICE "SYSCALL: rmdump triggered by process with pid = %d\n",pid);
++
++		//Locking for exclusive list manipulation
++		mutex_lock(&list_lock);
++		list_for_each_entry(temp_probe_node, &probe_list, list_node)
++		{
++			//Checking if dump_id matches with any probe in the list
++			//Also checking if the probe was registered by the same process which is trying to remove it.
++			if(temp_probe_node->probe_id == dumpid && temp_probe_node->pid == pid)
++			{
++				printk(KERN_NOTICE "RMDUMP: removing kprobe/dumpstack from %s with dumpid = %u.\n",temp_probe_node->symbol_name, temp_probe_node->probe_id);
++				//unregistering kprobe
++				unregister_kprobe(&temp_probe_node->probe);
++				//deleting unregistered kprobe from the list
++				list_del(&temp_probe_node->list_node);
++				mutex_unlock(&list_lock); //unlocking when operation done.
++				return 1;
++			}
++		}
++		//if nothing found, still unlocking mutex
++		mutex_unlock(&list_lock);
++		printk(KERN_ERR "RMDUMP: kprobe/dumpstack with dump_id = %u not found\n",dumpid);
++		return -EINVAL;
++	#else
++		return 0;
++	#endif
++}
++
++//funtion for automatic probe removal in case the owner process terminates without removing them. 
++int remove_residual_kprobes(pid_t pid)
++{
++	struct probe_struct* temp_probe_node;
++	struct list_head* temp_list_node;
++	struct marker_node *marked_node;
++	struct marker_node *temp_marked_node;
++
++	//making a dummy list for marking probes to be deleted. 
++	struct list_head marked_for_removal = LIST_HEAD_INIT(marked_for_removal);
++
++	temp_list_node = NULL;
++	temp_probe_node = NULL; 
++	temp_marked_node = NULL;
++
++	//for exclusive list manipulation
++	mutex_lock(&list_lock);
++	list_for_each_entry(temp_probe_node, &probe_list, list_node)
++	{	
++		//checking for probes created by terminated process.
++		if(temp_probe_node->pid == pid)
++		{
++			printk(KERN_NOTICE "EXIT DYNAMIC_DUMP_STACK: removing residual kprobe with dumpid %u created by pid = %d (terminated)\n",temp_probe_node->probe_id,pid);
++			//unregistering kprobe
++			unregister_kprobe(&temp_probe_node->probe);
++			marked_node = kmalloc(sizeof(struct marker_node), GFP_KERNEL);
++			memset(marked_node, 0, sizeof(struct marker_node));
++			//keeping the address of probe struct in a list for further deletion.
++			marked_node->pointer = &temp_probe_node->list_node;
++			//adding marked probes to a temporay list
++			list_add(&marked_node->list_node, &marked_for_removal);
++		}
++	}
++
++	list_for_each_entry(temp_marked_node, &marked_for_removal, list_node)
++	{
++		//deleting marked probes
++		list_del(temp_marked_node->pointer);
++	}
++	mutex_unlock(&list_lock);
++	return 0;
++}
+diff -uNr kernel.old/lib/Kconfig.debug kernel.new/lib/Kconfig.debug
+--- kernel.old/lib/Kconfig.debug	2017-06-17 10:44:58.000000000 -0700
++++ kernel.new/lib/Kconfig.debug	2020-04-29 22:08:45.412788000 -0700
+@@ -1714,6 +1714,14 @@
+ 	  that udelay() is working properly.
+ 
+ 	  If unsure, say N.
++	  
++config DYNAMIC_DUMP_STACK
++	bool "Enable dynamic stack dumping mode"
++	default n
++	help
++		Enable this option to add/remove dump stack dynamically via syscalls
++		
++		If unsure, say N.
+ 
+ source "samples/Kconfig"
+ 
+diff -uNr kernel.old/lib/Makefile kernel.new/lib/Makefile
+--- kernel.old/lib/Makefile	2017-06-17 10:44:58.000000000 -0700
++++ kernel.new/lib/Makefile	2020-04-29 22:10:00.483256000 -0700
+@@ -36,6 +36,8 @@
+ obj-$(CONFIG_TEST_BPF) += test_bpf.o
+ obj-$(CONFIG_TEST_FIRMWARE) += test_firmware.o
+ 
++obj-$(CONFIG_DYNAMIC_DUMP_STACK) += dynamic_dump_stack.o
++
+ ifeq ($(CONFIG_DEBUG_KOBJECT),y)
+ CFLAGS_kobject.o += -DDEBUG
+ CFLAGS_kobject_uevent.o += -DDEBUG
